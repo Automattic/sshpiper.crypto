@@ -615,7 +615,9 @@ func (t *handshakeTransport) enterKeyExchange(otherInitPacket []byte) error {
 		return err
 	}
 
-	if t.sessionID == nil {
+	//we would need this for SSH_MSG_EXT_INFO message
+	firstKeyExchange := t.sessionID == nil
+	if firstKeyExchange {
 		t.sessionID = result.H
 	}
 	result.SessionID = t.sessionID
@@ -626,6 +628,49 @@ func (t *handshakeTransport) enterKeyExchange(otherInitPacket []byte) error {
 	if err = t.conn.writePacket([]byte{msgNewKeys}); err != nil {
 		return err
 	}
+
+	// v0.0.0-sshpiper-20220822-01
+	// At this point (after SSH2_MSG_NEWKEYS message) we need to inform the
+	// newer openssh clients (8.8+ ... which don't support rsa-sha sign algos)
+	// about server's supported sign algos where we need to include RSA SSH2.
+	// If the server does not provide this message then the client will not
+	// attempt to authenticate with any RSA key as the server may not support
+	// RSA SSH2 (256 & 512).
+	// sshpiperd uses golang's crypto library and we can fix that on server side
+	// with ext-info-c SSH extension which is supported by the new ssh clients
+	// and send SSH_MSG_EXT_INFO message that contains RSA SSH2 algorithms.
+	// More info: RFC 8308, Sections 2.4 and 3.1.
+	//
+	// Send extInfo only if this is the first key exchange and this is a server.
+	if firstKeyExchange && len(t.hostKeys) > 0 {
+		// Check if the client supports ext-info-c SSH extension (openssh 7.2+)
+		// so we can send supported server-sig-algs message.
+		if contains(clientInit.KexAlgos, "ext-info-c") {
+			// For this to work with both old and new ssh clients we only need
+			// announce RSA SHA2 algos for the newer ssh clients, but we'll also
+			// include all supported by the golang's crypto lib to replicate the
+			// message from newest openssh server (except: webauthn-*).
+			// The algorithms order doesn't matter.
+			var PubKeyAlgos string = fmt.Sprintf("%s,%s,%s,%s,%s,%s,%s,%s,%s,%s",
+				KeyAlgoED25519,KeyAlgoSKED25519,KeyAlgoSKECDSA256,
+				KeyAlgoECDSA256,KeyAlgoECDSA384,KeyAlgoECDSA521,
+				KeyAlgoRSASHA256,KeyAlgoRSASHA512,KeyAlgoRSA,KeyAlgoDSA)
+			// Generate the SSH_MSG_EXT_INFO message
+			// - extInfoMsg is defined in ssh/messages.go
+			extInfo := &extInfoMsg{
+				NumExtensions: 1,
+				Payload: make([]byte, 0, 4 + 15 + 4 + len(PubKeyAlgos)),
+			}
+			extInfo.Payload = appendInt(extInfo.Payload, len("server-sig-algs"))
+			extInfo.Payload = append(extInfo.Payload, "server-sig-algs"...)
+			extInfo.Payload = appendInt(extInfo.Payload, len(PubKeyAlgos))
+			extInfo.Payload = append(extInfo.Payload, PubKeyAlgos...)
+			if err := t.conn.writePacket(Marshal(extInfo)); err != nil {
+				return err
+			}
+		}
+	}
+
 	if packet, err := t.conn.readPacket(); err != nil {
 		return err
 	} else if packet[0] != msgNewKeys {
