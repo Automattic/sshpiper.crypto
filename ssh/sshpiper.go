@@ -464,11 +464,45 @@ func (pipe *pipedConn) ack(key PublicKey) error {
 }
 
 func (pipe *pipedConn) checkPublicKey(msg *userAuthRequestMsg, pubkey PublicKey, sig *Signature) (bool, error) {
+	// The problem here is that this code is outdated and does not support
+	// RSA SHA256 and SHA512 algos. It's copied from server.go and modified
+	// to be more readable. However, for RSA keys this does not work as
+	// sig.Format is different then actual algorithm and pubkey.Verify fails
+	// the verification.
+	// The following changes are taken from golan crypto: server.go with few
+	// changes to be compatible with sshpiperd v0 API.
 
-	if !isAcceptableAlgo(sig.Format) {
-		return false, fmt.Errorf("ssh: algorithm %q not accepted", sig.Format)
+	// extract the payload from userAuthRequestMsg
+	payload := msg.Payload
+	if len(payload) < 1 {
+		return false, parseError(msgUserAuthRequest)
 	}
-	signedData := buildDataSignedForAuth(pipe.downstream.transport.getSessionID(), *msg, pubkey.Type(), pubkey.Marshal())
+	payload = payload[1:]
+	algoBytes, payload, ok := parseString(payload)
+	if !ok {
+		return false, parseError(msgUserAuthRequest)
+	}
+
+	// Ensure the public key algo and signature algo are supported. Compare the
+	// private key algorithm name that corresponds to algo with sig.Format.
+	// This is usually the same, but for certs, the names differ like ssh-rsa.
+	algo := string(algoBytes)
+	if !isAcceptableAlgo(algo) {
+		return false, fmt.Errorf("ssh: algorithm %q not accepted", algo)
+	}
+	if underlyingAlgo(algo) != sig.Format {
+		return false, fmt.Errorf("ssh: signature %q not compatible with selected algorithm %q", sig.Format, algo)
+	}
+
+	pubKeyData, payload, ok := parseString(payload)
+	if !ok {
+		return false, parseError(msgUserAuthRequest)
+	}
+	// For the new openssh clients that support ext-info-c we send a message with
+	// the server's supported sign algos, that includes rsa-sha2-256 and rsa-sha2-512.
+	// The client then can use sha2-512 and pubkey.Type() will be "rsa-sha2-512"
+	// instead of "ssh-rsa", which will fail the verification.
+	signedData := buildDataSignedForAuth(pipe.downstream.transport.getSessionID(), *msg, algo, pubKeyData)
 
 	if err := pubkey.Verify(signedData, sig); err != nil {
 		return false, nil
